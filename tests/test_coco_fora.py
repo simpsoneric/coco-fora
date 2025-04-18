@@ -95,7 +95,10 @@ class Testbench(BaseBench):
         # where the target drive is: `drive(AXI4StreamBackpressure)`
         # - like the StreamInitiator -> this is a single setting of the tready() signal
         # - the BaseDriver loop continually accepts new AXI4StreamBackpressure transactions (enables setting, clearing tready)
-        driver = AXI4StreamTarget(self, outbound_io, self.clk, self.rst)
+        #
+        # NOTE: Blocking
+        # - Setting it to False to keep it from stopping a testbench from closing without error
+        driver = AXI4StreamTarget(self, outbound_io, self.clk, self.rst, blocking=False)
 
         # On thing I don't like about the dynamic registration approach
         # is losing the type of "monitor".  I wonder if I can keep it somehow
@@ -110,9 +113,18 @@ class Testbench(BaseBench):
         self.register("outbound_mon", monitor)
         self.register("outbound_drv", driver)
 
+    def model(
+        self,
+        driver: AXI4StreamInitiator,
+        event: DriverEvent,
+        obj: AXI4StreamTransfer,
+    ):
+        self.log.info("Got %s", obj)
+        self.scoreboard.channels["outbound_mon"].push_reference(obj)
+
 
 @cocotb.test(timeout_time=10000, timeout_unit="ns")
-async def smoke_cocotb_standalone(dut: HierarchyObject):
+async def cocotb_smoke(dut: HierarchyObject):
     await Timer(100, "ns")
     cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
     await RisingEdge(dut.clk)
@@ -120,7 +132,7 @@ async def smoke_cocotb_standalone(dut: HierarchyObject):
 
 
 @Testbench.testcase(timeout=2000)
-async def smoke_forastero(tb: Testbench, _log: SimLog):
+async def forastero_smoke(tb: Testbench, _log: SimLog):
     await ClockCycles(tb.clk, 10)
 
 
@@ -146,16 +158,77 @@ async def forastero_direct_drive(tb: Testbench, log: SimLog):
         log.info(resp)
 
 
+@forastero.sequence(auto_lock=False)
+@forastero.requires("stream", AXI4StreamInitiator)
+async def burst_a_few(
+    ctx: SeqContext,
+    stream: AXI4StreamInitiator,
+    length: int = 4,
+):
+    await stream.idle()
+    async with ctx.lock(stream):
+        ctx.log.info("Starting burst a few")
+        for _ in range(length):
+            elem = AXI4StreamTransfer(data=ctx.random.getrandbits(16))
+            stream.enqueue(elem)
+
+        ctx.log.info("Done bursting a few")
+    await stream.idle()
+
+
 @Testbench.testcase(timeout=2000)
-async def simple_forastero(tb: Testbench, log: SimLog):
-    tb.schedule(axi4stream_backpressure(driver=tb.outbound_drv))
+async def forastero_with_schedule(tb: Testbench, log: SimLog):
+    # We can use a "subscribe/callback" approach to feed our model.
+    # What -> Anytime a transaction is driven, we can call the `tb.model()`` and push expected values into scoreboard
+    # Why  -> This helps decouple the stimulus transactions from results
+    tb.inbound_drv.subscribe(DriverEvent.POST_DRIVE, tb.model)
+
+    tb.schedule(axi4stream_backpressure(driver=tb.outbound_drv), blocking=False)
+    tb.schedule(burst_a_few(stream=tb.inbound_drv, length=3))
+
+    # manually drive a few in
+    for _ in range(4):
+        elem = AXI4StreamTransfer(data=tb.random.getrandbits(16))
+        tb.inbound_drv.enqueue(elem)
+        # model callback does the pushing for us
+
+    tb.log.info("starting return")
+
+
+@Testbench.testcase(timeout=2000)
+async def forastero_with_schedule_0(tb: Testbench, log: SimLog):
+    # We can use a "subscribe/callback" approach to feed our model.
+    # What -> Anytime a transaction is driven, we can call the `tb.model()`` and push expected values into scoreboard
+    # Why  -> This helps decouple the stimulus transactions from results
+    tb.inbound_drv.subscribe(DriverEvent.POST_DRIVE, tb.model)
+
+    tb.schedule(axi4stream_backpressure(driver=tb.outbound_drv), blocking=False)
+
+    # Even if our num transactions = 0 -> this is currently passing.
+    tb.schedule(burst_a_few(stream=tb.inbound_drv, length=0))
+
+    # manually drive a few in
+    for _ in range(4):
+        elem = AXI4StreamTransfer(data=tb.random.getrandbits(16))
+        tb.inbound_drv.enqueue(elem)
+        # model callback does the pushing for us
+
+    tb.log.info("starting return")
+
+
+@Testbench.testcase(timeout=2000)
+async def forastero_no_schedule_tx(tb: Testbench, log: SimLog):
+    tb.inbound_drv.subscribe(DriverEvent.POST_DRIVE, tb.model)
+
+    tb.schedule(axi4stream_backpressure(driver=tb.outbound_drv), blocking=False)
+    # tb.schedule(burst_a_few(stream=tb.inbound_drv, length=0))
 
     for _ in range(4):
         elem = AXI4StreamTransfer(data=tb.random.getrandbits(16))
         tb.inbound_drv.enqueue(elem)
-        tb.scoreboard.channels["outbound_mon"].push_reference(elem)
+        # tb.scoreboard.channels["outbound_mon"].push_reference(elem)
 
-    await ClockCycles(tb.clk, 100)
+    tb.log.info("starting return")
 
 
 def test_coco_fora() -> None:
